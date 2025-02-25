@@ -80,10 +80,14 @@ class RainbowAgent:
             1.0
         ))
 
+    # Python
     def act(self, state_seq):
+        import numpy as np
+        # Epsilon-greedy exploration
+        if np.random.rand() < self.epsilon and not self.is_eval:
+            return np.random.randint(self.action_size)
         if state_seq.ndim == 2:
             state_seq = state_seq[np.newaxis, ...]
-            
         state = torch.FloatTensor(state_seq).to(self.device)
         with torch.no_grad():
             q_values = self.model(state)

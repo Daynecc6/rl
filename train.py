@@ -105,6 +105,10 @@ def train():
         if losses:
             print(f"Average Loss: {np.mean(losses):.4f}")
         print(f"Episode Sharpe Ratio: {sharpe_ratio:.4f}")
+
+    # Save trained model
+    torch.save(agent.model.state_dict(), "model_checkpoint.pth")
+    print("Model saved to model_checkpoint.pth")
     
     return agent, test_df
 
