@@ -1,4 +1,6 @@
+import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from models.layers import NoisyLinear
 from config import Config
 
@@ -23,6 +25,14 @@ class RainbowLSTMDQN(nn.Module):
             nn.ReLU(),
             NoisyLinear(64, action_size)
         )
+        
+        # Confidence stream - predicts the confidence in the decision
+        self.confidence_fc = nn.Sequential(
+            nn.Linear(lstm_hidden, 64),
+            nn.ReLU(),
+            nn.Linear(64, action_size),
+            nn.Sigmoid()  # Output between 0 and 1
+        )
 
     def forward(self, x):
         lstm_out, _ = self.lstm(x)
@@ -30,9 +40,12 @@ class RainbowLSTMDQN(nn.Module):
         
         value = self.value_fc(features)
         advantage = self.advantage_fc(features)
+        confidence = self.confidence_fc(features)
         
+        # Dueling network formula
         q = value + advantage - advantage.mean(dim=1, keepdim=True)
-        return q
+        
+        return q, confidence
 
     def reset_noise(self):
         for module in self.modules():

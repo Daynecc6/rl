@@ -49,8 +49,14 @@ class RainbowAgent:
         self.frame_idx = 0
         
         # Trading state
-        self.inventory = []
+        self.inventory = []  # Will now store tuples of (price, position_size, stop_loss, take_profit)
+        self.position_size = 0.0  # Track total position size (0 to 1.0)
+        self.confidence_threshold = Config.CONFIDENCE_THRESHOLD  # Minimum confidence for full position
         self.is_eval = False
+        
+        # Risk management
+        self.stop_loss_pct = Config.STOP_LOSS_PCT
+        self.take_profit_pct = Config.TAKE_PROFIT_PCT
 
     def update_target_network(self):
         self.target_model.load_state_dict(self.model.state_dict())
@@ -80,18 +86,73 @@ class RainbowAgent:
             1.0
         ))
 
-    # Python
     def act(self, state_seq):
         import numpy as np
-        # Epsilon-greedy exploration
+        # Epsilon-greedy exploration during training
         if np.random.rand() < self.epsilon and not self.is_eval:
-            return np.random.randint(self.action_size)
+            action = np.random.randint(self.action_size)
+            confidence = 0.5  # Default confidence for random actions
+            return action, confidence
+            
         if state_seq.ndim == 2:
             state_seq = state_seq[np.newaxis, ...]
         state = torch.FloatTensor(state_seq).to(self.device)
+        
         with torch.no_grad():
-            q_values = self.model(state)
-        return q_values.argmax().item()
+            q_values, confidence = self.model(state)
+            
+        # Get the best action and its confidence
+        action = q_values.argmax(dim=1).item()
+        action_confidence = confidence[0, action].item()
+        
+        return action, action_confidence
+    
+    def calculate_position_size(self, confidence, vol_factor=1.0):
+        """
+        Calculate position size based on confidence and market volatility.
+        
+        Args:
+            confidence: Model's confidence in the action (0-1)
+            vol_factor: Volatility scaling factor (higher volatility = smaller position)
+            
+        Returns:
+            float: Position size (0-1)
+        """
+        # Base position size based on confidence
+        position_size = confidence
+        
+        # Scale by volatility (inverse relationship)
+        position_size = position_size / vol_factor
+        
+        # Apply minimum confidence threshold
+        if confidence < self.confidence_threshold:
+            position_size *= (confidence / self.confidence_threshold)
+        
+        # Ensure maximum position size limit
+        position_size = min(position_size, Config.MAX_POSITION_SIZE)
+        
+        return position_size
+    
+    def calculate_dynamic_stops(self, price, vol_factor=1.0):
+        """
+        Calculate dynamic stop-loss and take-profit levels based on volatility.
+        
+        Args:
+            price: Current price 
+            vol_factor: Volatility scaling factor
+            
+        Returns:
+            tuple: (stop_loss_price, take_profit_price)
+        """
+        # Scale stop loss and take profit by volatility
+        stop_loss_pct = self.stop_loss_pct * vol_factor
+        take_profit_pct = self.take_profit_pct * vol_factor
+        
+        # Calculate actual price levels
+        stop_loss_price = price * (1 - stop_loss_pct)
+        take_profit_price = price * (1 + take_profit_pct)
+        
+        return stop_loss_price, take_profit_price
 
     def train_step(self):
         if len(self.memory.buffer) < self.batch_size:
@@ -124,18 +185,20 @@ class RainbowAgent:
         dones = torch.FloatTensor(dones).to(self.device)
         weights = torch.FloatTensor(weights).to(self.device)
 
-        # Compute target Q-values
-        next_q_online = self.model(next_states)
+        # Compute current and target Q-values
+        current_q, _ = self.model(states)
+        current_q = current_q.gather(1, actions.unsqueeze(1)).squeeze(1)
+        
+        # Double DQN: get actions from online network
+        next_q_online, _ = self.model(next_states)
         next_actions = next_q_online.argmax(dim=1)
         
         with torch.no_grad():
-            next_q_target = self.target_model(next_states)
-
-        target_q = rewards + (1 - dones) * \
-                  (self.gamma ** self.n_steps) * \
-                  next_q_target.gather(1, next_actions.unsqueeze(1)).squeeze(1)
-                  
-        current_q = self.model(states).gather(1, actions.unsqueeze(1)).squeeze(1)
+            next_q_target, _ = self.target_model(next_states)
+            next_q = next_q_target.gather(1, next_actions.unsqueeze(1)).squeeze(1)
+        
+        # Compute target using n-step returns
+        target_q = rewards + (1 - dones) * (self.gamma ** self.n_steps) * next_q
         
         # Compute loss and update priorities
         td_error = target_q - current_q
@@ -181,3 +244,37 @@ class RainbowAgent:
                 last_done,
                 1.0
             ))
+    
+    def check_stop_loss_take_profit(self, current_price):
+        """Check if any open positions have hit stop-loss or take-profit levels.
+        
+        Returns:
+            tuple: (triggered_positions, remaining_positions, total_profit)
+        """
+        if not self.inventory:
+            return [], [], 0.0
+            
+        triggered_positions = []
+        remaining_positions = []
+        total_profit = 0.0
+        
+        for entry_price, size, stop_loss, take_profit in self.inventory:
+            # Check for take profit
+            if current_price >= take_profit:
+                profit = (current_price - entry_price) * size
+                total_profit += profit
+                triggered_positions.append((entry_price, size, stop_loss, take_profit, profit, "TAKE_PROFIT"))
+                self.position_size -= size
+            # Check for stop loss
+            elif current_price <= stop_loss:
+                loss = (current_price - entry_price) * size
+                total_profit += loss
+                triggered_positions.append((entry_price, size, stop_loss, take_profit, loss, "STOP_LOSS"))
+                self.position_size -= size
+            else:
+                remaining_positions.append((entry_price, size, stop_loss, take_profit))
+        
+        # Update inventory to only include remaining positions
+        self.inventory = remaining_positions
+        
+        return triggered_positions, remaining_positions, total_profit
